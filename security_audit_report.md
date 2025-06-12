@@ -1,4 +1,4 @@
-# Draft Security Audit Report - Immutable zkEVM Bridge Contracts
+# Security Audit Report - Immutable zkEVM Bridge Contracts
 
 ## 1. High-Level Summary
 
@@ -13,11 +13,11 @@
 **Key Objective:** To identify potential vulnerabilities, design weaknesses, and areas for improvement in the provided smart contracts.
 
 **Most Critical Findings:**
-1.  **Reentrancy Vulnerability in Native ETH Withdrawals:** A reentrancy path exists when processing non-queued native ETH withdrawals, potentially allowing a malicious receiver to re-enter the bridge contract before the initial withdrawal transaction fully completes. This vulnerability persists in `RootERC20BridgeFlowRate.sol` as it inherits the vulnerable logic from `RootERC20Bridge.sol` without adding specific mitigation for this path.
-2.  **Critical Reliance on Bridge Adaptor Integrity:** The security of funds held by the bridge heavily depends on the trustworthiness and security of the designated `IRootBridgeAdaptor` implementation. A compromised or malicious adaptor can forge messages to drain any and all assets from the bridge.
-3.  **Centralized Risks via Administrative Roles:** Several administrative roles (`ADAPTOR_MANAGER_ROLE`, `RATE_CONTROL_ROLE`, `DEFAULT_ADMIN_ROLE`, etc.) have powerful capabilities. If compromised, these roles could lead to theft of funds, permanent or temporary Denial of Service (DoS), or render security mechanisms ineffective.
+1.  **Critical Reliance on Bridge Adaptor Integrity:** The security of funds held by the bridge heavily depends on the trustworthiness and security of the designated `IRootBridgeAdaptor` implementation. A compromised or malicious adaptor can forge messages to drain any and all assets from the bridge.
+2.  **Centralized Risks via Administrative Roles:** Several administrative roles (`ADAPTOR_MANAGER_ROLE`, `RATE_CONTROL_ROLE`, `DEFAULT_ADMIN_ROLE`, etc.) have powerful capabilities. If compromised, these roles could lead to theft of funds, permanent or temporary Denial of Service (DoS), or render security mechanisms ineffective.
+3.  **Reentrancy Pattern in Native ETH Withdrawals (Non-Queued Path):** While a direct double-spend by the receiver re-entering `onMessageReceive` is prevented by the `onlyBridgeAdaptor` modifier, the execution path for non-queued native ETH withdrawals involves an external call to the receiver before the transaction fully concludes and without the entire path being protected by a reentrancy guard. This is a structural weakness violating security best practices. This vulnerability persists in `RootERC20BridgeFlowRate.sol`.
 
-Overall, while the contracts incorporate several good security practices, the identified critical vulnerabilities, particularly reentrancy and adaptor trust, require immediate attention. Other findings relate to potential DoS vectors through admin role misuse, griefing attacks, and known MEV patterns.
+Overall, while the contracts incorporate several good security practices, the identified critical and high-severity issues, particularly those related to adaptor trust, administrative controls, and the reentrancy pattern, require immediate attention. Other findings relate to potential DoS vectors through admin role misuse, griefing attacks, and known MEV patterns.
 
 ---
 
@@ -59,15 +59,24 @@ Overall, while the contracts incorporate several good security practices, the id
 
 ### High Severity
 
-#### HIGH-01: Reentrancy in Native ETH Withdrawals (Non-Queued Path)
+#### HIGH-01: Reentrancy Pattern in Native ETH Withdrawals (Non-Queued Path)
 
 *   **Severity:** High
-*   **Contract(s) & Function(s) Involved:** `RootERC20Bridge._executeTransfer` (specifically the `Address.sendValue` part), `RootERC20Bridge.onMessageReceive`, `RootERC20Bridge._withdraw`. This vulnerability persists in `RootERC20BridgeFlowRate.sol` for non-queued withdrawals.
-*   **Description:** When native ETH is withdrawn, `_executeTransfer` uses `Address.sendValue(payable(receiver), amount)`. If the `receiver` is a malicious contract, its `receive()` or `fallback()` payable function can call back into the bridge contract. The call path `onMessageReceive` -> `_withdraw` -> `_executeTransfer` is not protected by a `nonReentrant` modifier in either `RootERC20Bridge` or `RootERC20BridgeFlowRate` (for the non-queued path).
-*   **Exploitation:** A malicious contract, acting as the `receiver` of a native ETH withdrawal, could re-enter `onMessageReceive` (if the adaptor allows/relays such re-entrant messages from L2, or if the attacker can somehow bypass the adaptor check during re-entry, though less likely) or other public functions. If `onMessageReceive` could be re-entered with the same message parameters before the first withdrawal fully completes its state updates (though a specific exploit here is complex and depends on adaptor behavior), it might lead to issues. More plausibly, re-entering other unprotected public functions could manipulate state or attempt further actions.
-*   **Impact:** Potential for draining more funds than authorized if reentrancy allows triggering additional withdrawals or manipulating state related to the withdrawal process. The exact impact depends on which functions can be profitably re-entered and the behavior of the bridge adaptor in handling re-entrant calls from L2.
-*   **Recommendation:** Apply the `nonReentrant` modifier (from OpenZeppelin's `ReentrancyGuardUpgradeable`) to the `onMessageReceive` function in `RootERC20Bridge.sol` (which `RootERC20BridgeFlowRate.sol` inherits and uses). This would protect the entire external message handling flow, including immediate withdrawals.
-*   **Reference to Plan Step:** RootERC20Bridge Part 2 (Step 1), RootERC20BridgeFlowRate Part 2 (Step 2).
+*   **Contract(s) & Function(s) Involved:** `RootERC20Bridge._executeTransfer` (specifically the `Address.sendValue` part), `RootERC20Bridge.onMessageReceive`, `RootERC20Bridge._withdraw`. This vulnerability pattern persists in `RootERC20BridgeFlowRate.sol` for non-queued withdrawals.
+*   **Description:**
+    *   When native ETH is withdrawn via the non-queued path, `_executeTransfer` uses `Address.sendValue(payable(receiver), amount)`. This is an external call to the `receiver` contract.
+    *   The call path `onMessageReceive` -> `_withdraw` -> `_executeTransfer` is not protected by a `nonReentrant` modifier in either `RootERC20Bridge` or `RootERC20BridgeFlowRate`.
+    *   If the `receiver` is a malicious contract, its `receive()` or `fallback()` payable function can call back into public functions of the bridge contract *before* the initial `_executeTransfer` (and thus the `onMessageReceive` call) has fully completed its effects (e.g., event emission).
+*   **Exploitability & Impact:**
+    *   A direct double-spend of the *same* withdrawal instance by the `receiver` contract forcing the bridge to re-process the exact same withdrawal message by re-entering `onMessageReceive` is **prevented**. This is due to the `onlyBridgeAdaptor` modifier on `onMessageReceive`, which would block a call where `msg.sender` is the `receiver` contract (not the `rootBridgeAdaptor`).
+    *   However, the structural weakness remains: an external call is made to an untrusted `receiver` contract before the transaction fully concludes and without the entire operation (`onMessageReceive` and its internal calls for this withdrawal path) being encapsulated in a reentrancy guard. This allows the `receiver` to make re-entrant calls to *other* public/external functions of the bridge.
+    *   While a specific, direct fund-theft vector through these *other* re-entrant calls (e.g., to `mapToken` or `deposit` functions) was not identified with the current set of public functions and their individual protections (like `nonReentrant` on deposit functions or role checks on admin functions), this pattern is dangerous because:
+        1.  It violates the Checks-Effects-Interactions security principle (interaction before all effects like event emission).
+        2.  It creates a window for potential exploits if any re-entered public functions have subtle vulnerabilities when called in such an interleaved context, or if they can manipulate state in a way that benefits the attacker in a subsequent transaction.
+        3.  It poses future risks if new, less-protected, or exploitable public functions are added to the bridge.
+        4.  It can lead to unexpected state interactions that are hard to reason about.
+*   **Recommendation:** Apply the `nonReentrant` modifier (from OpenZeppelin's `ReentrancyGuardUpgradeable`) to the `onMessageReceive` function in `RootERC20Bridge.sol` (which `RootERC20BridgeFlowRate.sol` inherits and uses). This would protect the entire external message handling flow, including immediate withdrawals, ensuring atomicity and preventing any re-entrant calls from the `receiver` back into any part of the bridge during the withdrawal process. Alternatively, apply the guard to the virtual `_withdraw` function in both `RootERC20Bridge` and its override in `RootERC20BridgeFlowRate`.
+*   **Reference to Plan Step:** RootERC20Bridge Part 2 (Step 1), RootERC20BridgeFlowRate Part 2 (Step 2), Reentrancy Deep Dive.
 
 #### HIGH-02: L1 Funds Potentially Stuck if L2 Execution Fails After `sendMessage`
 
@@ -158,7 +167,7 @@ Overall, while the contracts incorporate several good security practices, the id
     *   A faulty adaptor that succeeds on L1 but fails to ensure L2 execution can lead to user funds being stuck on L1.
 *   **L2 System Reliability:** The overall success of bridging operations depends on the reliability of the L2 system to correctly process messages sent from L1 and to send valid messages back. Failures on L2 can impact L1 assets or user experience.
 *   **MEV and Griefing:** The system is exposed to standard MEV front-running tactics, and the flow-rate mechanism introduces a specific griefing vector where an attacker can force other users' withdrawals into the queue. While difficult to eliminate entirely, parameter tuning can make these attacks more costly.
-*   **Complexity of FlowRate System:** The `RootERC20BridgeFlowRate` contract, by inheriting and combining three distinct functionalities (base bridge, flow detection, withdrawal queue), is complex. While this modularity is good for development, it requires careful analysis of interactions, as demonstrated by the reentrancy issue persisting in one path.
+*   **Complexity of FlowRate System:** The `RootERC20BridgeFlowRate` contract, by inheriting and combining three distinct functionalities (base bridge, flow detection, withdrawal queue), is complex. While this modularity is good for development, it requires careful analysis of interactions.
 
 ---
 
@@ -169,7 +178,7 @@ Overall, while the contracts incorporate several good security practices, the id
 *   **Initialization Protection:** Use of `initializer` modifier and `initializerAddress` check in constructor effectively prevents front-running of initialization.
 *   **Immutability of Critical Addresses Post-Initialization:** Key addresses like `childERC20Bridge`, `childTokenTemplate`, `rootIMXToken`, `rootWETHToken` are set once and cannot be changed, reducing attack surface.
 *   **Specific Input Validations:** Numerous checks for `address(0)`, zero amounts, and correct `msg.value` are present.
-*   **`nonReentrant` Modifier Usage:** Applied to the deposit flow (`_deposit`) and to the finalization of queued withdrawals (`finaliseQueuedWithdrawal`, `finaliseQueuedWithdrawalsAggregated`), which is good. (The gap is in the non-queued withdrawal path).
+*   **`nonReentrant` Modifier Usage:** Applied to the deposit flow (`_deposit`) and to the finalization of queued withdrawals (`finaliseQueuedWithdrawal`, `finaliseQueuedWithdrawalsAggregated`), which is good. (The gap identified is in the non-queued withdrawal path).
 *   **Balance Invariant Checks:** The `expectedBalance` checks in deposit functions (`_depositETH`, `_depositWrappedETH`, `_depositERC20`) provide a strong safeguard against accounting errors or issues with external token interactions (like WETH unwrapping).
 *   **Explicit Handling of Non-Standard Tokens:** The `_getTokenDetails` function attempts to fetch metadata and reverts with `TokenNotSupported` if standard functions are missing. Comments also warn about undefined behavior for non-standard ERC20s (e.g., rebasing tokens).
 *   **Robust Error Handling:** Custom errors are defined, providing more context than simple reverts with string messages.
@@ -177,4 +186,4 @@ Overall, while the contracts incorporate several good security practices, the id
 
 ---
 
-This draft report consolidates the findings from the detailed analysis. Further review and discussion are recommended, particularly regarding the critical and high-severity issues.
+This security audit report consolidates the findings from the detailed analysis. Further review and discussion are recommended, particularly regarding the critical and high-severity issues.
